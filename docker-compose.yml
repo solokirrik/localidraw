@@ -1,0 +1,131 @@
+# Hardened ExcaliDash deployment.
+#
+# Differences from upstream docker-compose.prod.yml:
+#   - Images pinned by digest (0.6.7), not :latest.
+#   - AUTH_MODE from .env: `local` (email/password) for now, `oidc_enforced` (Google) later.
+#     In local mode, finish the setup page yourself right after the first start: until then
+#     anyone who can reach the page can choose to turn authentication off.
+#   - No telemetry: Prisma checkpoint and the GitHub update check are off.
+#   - The backend has NO route to the internet. Its only outbound traffic (OIDC
+#     discovery, token exchange, JWKS) goes through the `egress` proxy, which allows
+#     only the domains listed in egress/filter and logs every connection.
+#   - The frontend (nginx) can't reach the internet either: its network has no outbound NAT.
+#   - Containers drop all Linux capabilities, can't gain privileges, and have
+#     memory and process limits. The frontend's filesystem is read-only.
+#   - Published only on 127.0.0.1: put a TLS reverse proxy (Caddy, nginx, Traefik) in front.
+#
+# Usage:
+#   cp .env.example .env && ./gen-secrets.sh >> .env   # then fill in the OIDC values
+#   docker compose up -d
+#   docker compose logs -f egress                       # watch every outbound connection
+
+x-hardening: &hardening
+  init: true
+  restart: unless-stopped
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  backend:
+    <<: *hardening
+    image: zimengxiong/excalidash-backend:0.6.7@sha256:b77d43d9f70e414279e0babbbd59803086868e23148f071b8d65fb1e49bce836
+    # The image's entrypoint rewrites files under /app/dist at startup, so its root
+    # filesystem can't be read-only. It runs as uid 1001 with no capabilities.
+    environment:
+      NODE_ENV: production
+      PORT: "8000"
+      DATABASE_PROVIDER: sqlite
+      DATABASE_URL: file:/app/prisma/dev.db
+      FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL (public https URL)}
+      # Your TLS proxy -> frontend nginx -> backend: 2 hops. Your TLS proxy must
+      # append to X-Forwarded-For, not pass through a client-supplied value unchecked.
+      TRUST_PROXY: ${TRUST_PROXY:-2}
+
+      # --- secrets (generate with ./gen-secrets.sh) ---
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      CSRF_SECRET: ${CSRF_SECRET:?set CSRF_SECRET}
+      API_KEY_HASH_PEPPER: ${API_KEY_HASH_PEPPER:?set API_KEY_HASH_PEPPER (never change it after API keys exist)}
+
+      # --- auth ---
+      # local: email/password accounts. oidc_enforced: Google (or another IdP) only.
+      # In oidc_enforced mode the backend refuses to start if the OIDC_* values are missing.
+      AUTH_MODE: ${AUTH_MODE:?set AUTH_MODE to local or oidc_enforced}
+      OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:-Google}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-https://accounts.google.com}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_REQUIRE_EMAIL_VERIFIED: "true"
+      OIDC_JIT_PROVISIONING: ${OIDC_JIT_PROVISIONING:-true}
+      OIDC_FIRST_USER_ADMIN: ${OIDC_FIRST_USER_ADMIN:-true}
+      OIDC_ADMIN_GROUPS: ${OIDC_ADMIN_GROUPS:-}
+
+      # --- no telemetry / no phoning home ---
+      CHECKPOINT_DISABLE: "1"          # Prisma CLI telemetry (checkpoint.prisma.io)
+      UPDATE_CHECK_OUTBOUND: "false"   # GitHub releases check
+
+      # --- outbound only through the allowlisting proxy (Node 24 built-in support) ---
+      NODE_USE_ENV_PROXY: "1"
+      HTTPS_PROXY: http://egress:8888
+      HTTP_PROXY: http://egress:8888
+      NO_PROXY: localhost,127.0.0.1,backend,frontend
+    volumes:
+      - backend-data:/app/prisma
+    networks: [app, egress-int]
+    mem_limit: 1g
+    pids_limit: 256
+    depends_on: [egress]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:8000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    <<: *hardening
+    image: zimengxiong/excalidash-frontend:0.6.7@sha256:0d1f4e852f052872b9a9f2e0267a7a0ba5ba3e0d2d097ad2d82371f6c3f0de2d
+    read_only: true
+    tmpfs:
+      - /tmp:uid=101,gid=101,mode=0700,size=64m
+    ports:
+      - "127.0.0.1:${HOST_PORT:-6767}:8080"
+    networks: [edge, app]
+    mem_limit: 256m
+    pids_limit: 64
+    depends_on: [backend]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Forward proxy: the backend's only way out. Denies every domain not in egress/filter
+  # and logs each CONNECT, so `docker compose logs egress` is a full outbound audit trail.
+  egress:
+    <<: *hardening
+    build: ./egress
+    image: localidraw-egress:1
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=8m
+    networks: [egress-int, egress-out]
+    mem_limit: 64m
+    pids_limit: 32
+
+networks:
+  edge:                     # host -> frontend (published port)
+    driver_opts:
+      # No outbound NAT: the published port still works, but the frontend
+      # can't open connections to the internet.
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  app:
+    internal: true          # frontend <-> backend, no internet
+  egress-int:
+    internal: true          # backend <-> egress proxy, no internet
+  egress-out: {}            # egress proxy -> internet
+
+volumes:
+  backend-data:
